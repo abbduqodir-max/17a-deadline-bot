@@ -7,6 +7,7 @@ This bot does not log into Moodle or fetch live deadlines automatically.
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import logging
 import os
@@ -255,7 +256,9 @@ class TelegramAPI:
         self.base='https://api.telegram.org/bot'+token+'/'
 
     def call(self, method: str, **kwargs):
-        params={k:(json.dumps(v,ensure_ascii=False) if isinstance(v,(list,dict)) else v) for k,v in kwargs.items() if v is not None}
+        params={k:(json.dumps(v,ensure_ascii=False) if isinstance(v,(list,dict)) else
+                   str(v).lower() if isinstance(v,bool) else v)
+                for k,v in kwargs.items() if v is not None}
         body=urlencode(params).encode('utf-8')
         req=Request(self.base+method,data=body,headers={'Content-Type':'application/x-www-form-urlencoded'})
         try:
@@ -268,8 +271,8 @@ class TelegramAPI:
             raise RuntimeError('Telegram API: '+str(data.get('description','unknown error')))
         return data.get('result')
 
-    def send(self, chat_id: int, text: str):
-        return self.call('sendMessage',chat_id=chat_id,text=text,parse_mode='HTML',disable_web_page_preview='true')
+    def send(self, chat_id: int, text: str, **options):
+        return self.call('sendMessage',chat_id=chat_id,text=text,parse_mode='HTML',disable_web_page_preview=True,**options)
 
 
 def event_line(ev: dict, now: datetime, *, verbose: bool = True) -> str:
@@ -527,10 +530,11 @@ class Bot:
                 if time.monotonic()-last_scan >= 30:
                     self.dispatch_due()
                     last_scan=time.monotonic()
-                updates=self.api.call('getUpdates',offset=offset,timeout=20,allowed_updates=['message'])
+                updates=self.api.call('getUpdates',offset=offset,timeout=20,allowed_updates=['message','callback_query'])
                 for update in updates:
                     try:
                         if 'message' in update:self.handle_message(update['message'])
+                        elif 'callback_query' in update:self.handle_callback(update['callback_query'])
                     except Exception:
                         LOGGER.exception('Error processing update %s',update.get('update_id'))
                     offset=max(offset,update['update_id']+1)
@@ -543,6 +547,534 @@ class Bot:
                 return
 
 
+# --- Button-driven interface (backward-compatible with the original commands) ---
+
+def ui_button(label: str, action: str | None = None, *, url: str | None = None) -> dict:
+    return {'text': label, **({'url': url} if url else {'callback_data': action})}
+
+
+def ui_markup(*rows: list[dict]) -> dict:
+    return {'inline_keyboard': [r for r in rows if r]}
+
+
+class ButtonBot(Bot):
+    """Telegram inline menus; original Store, command API and scheduler stay intact."""
+
+    PAGE_SIZE = 5
+    ENGLISH = ('eng_ui', 'eng_b1', 'eng_a2')
+    RUSSIAN = ('ru_a2', 'ru_b1')
+    DRAFT_TIMEOUT = timedelta(minutes=45)
+
+    def __init__(self, api, store: Store):
+        super().__init__(api, store)
+        self.store.conn.execute('''CREATE TABLE IF NOT EXISTS ui_drafts (
+            chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            stage TEXT NOT NULL, payload TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(chat_id,user_id))''')
+        self.store.conn.execute('''CREATE TABLE IF NOT EXISTS lead_choices (
+            chat_id INTEGER NOT NULL, lead_hours INTEGER NOT NULL,
+            enabled INTEGER NOT NULL,
+            PRIMARY KEY(chat_id,lead_hours))''')
+        self.store.conn.commit()
+
+    def send(self, cid: int, message: str, markup: dict | None = None):
+        if markup is None:
+            return self.api.send(cid, message)
+        try:
+            return self.api.send(cid, message, reply_markup=markup)
+        except TypeError:  # compatibility with older offline test fakes
+            return self.api.send(cid, message)
+
+    def render(self, cid: int, text: str, markup: dict, origin: dict | None = None):
+        if origin and origin.get('message_id'):
+            try:
+                return self.api.call('editMessageText',chat_id=cid,message_id=origin['message_id'],
+                                     text=text,parse_mode='HTML',disable_web_page_preview=True,
+                                     reply_markup=markup)
+            except Exception as exc:
+                if 'message is not modified' in str(exc).lower():
+                    return None
+                LOGGER.info('Cannot edit menu, sending a new one: %s',str(exc)[:100])
+        return self.send(cid,text,markup)
+
+    def menu(self, cid: int, kind: str, origin: dict | None = None):
+        n=len(self.store.list_events(cid))
+        alerts=('✅ faol' if self.store.enabled(cid) else '🔕 o‘chiq')
+        title=('🎓 <b>17A · Deadline Assistant</b>\n'
+               'UWED 2026/27 · Toshkent vaqti 🇺🇿\n\n'
+               f'📌 <b>{n} ta</b> kelgusi deadline\n'
+               f'🔔 Eslatmalar: {alerts}\n\n'
+               'Kerakli bo‘limni tanlang 👇')
+        if kind!='private':
+            title+='\n\n<i>Shaxsiy til levelini tanlash uchun botni alohida chatda oching.</i>'
+        keys=ui_markup(
+            [ui_button('⏰ Eng yaqin 5 ta','v:next'),ui_button('📅 24 soat','v:today')],
+            [ui_button('🗓 7 kunlik reja','v:week'),ui_button('📋 Barcha deadline','v:all:0')],
+            [ui_button('📚 Fanlar bo‘yicha','subjects')],
+            [ui_button('🌐 Til guruhim','lang'),ui_button('🔔 Eslatmalar','rem')],
+            [ui_button('⚙️ Admin panel','admin'),ui_button('❓ Yordam','help')],
+        )
+        return self.render(cid,title,keys,origin)
+
+    def back_row(self, back: str = 'home'):
+        return [ui_button('⬅️ Orqaga',back),ui_button('🏠 Bosh menyu','home')]
+
+    def view_events(self, cid: int, mode: str, page: int = 0, origin: dict | None = None):
+        now=local_now()
+        events=self.store.list_events(cid,now=now)
+        if mode=='today':
+            events=[e for e in events if parse_due(e['deadline'])<=now+timedelta(hours=24)]
+        elif mode=='week':
+            events=[e for e in events if parse_due(e['deadline'])<=now+timedelta(days=7)]
+        elif mode=='next':
+            events=events[:5]
+        labels={'today':'📅 <b>Keyingi 24 soat</b>','week':'🗓 <b>Keyingi 7 kun</b>',
+                'next':'⏰ <b>Eng yaqin 5 ta deadline</b>','all':'📋 <b>Barcha deadline’lar</b>'}
+        back=f'v:{mode}:{page}'
+        return self._event_list(cid,events,labels.get(mode,labels['all']),back,page,'home',origin)
+
+    def _event_list(self,cid: int,events: list[dict],title: str,route: str,
+                    page: int,return_to: str,origin: dict | None):
+        pages=max(1,(len(events)+self.PAGE_SIZE-1)//self.PAGE_SIZE)
+        page=max(0,min(page,pages-1))
+        items=events[page*self.PAGE_SIZE:(page+1)*self.PAGE_SIZE]
+        if not events:
+            body=f'{title}\n\nBu bo‘limda hozircha kelgusi deadline yo‘q.\n\n<i>Ma’lumotlar Moodle’dan avtomatik yangilanmaydi.</i>'
+        else:
+            lines=[]
+            for index,e in enumerate(items,start=page*self.PAGE_SIZE+1):
+                lines.append(f'<b>{index}. {esc(e["subject"])}</b>\n'
+                             f'   {esc(e["kind"])} · <b>{esc(display_due(e["deadline"]))}</b>\n'
+                             f'   ⏳ {esc(remaining(e["deadline"]))} qoldi')
+            body=f'{title} · {len(events)} ta\nSahifa {page+1}/{pages}\n\n'+'\n\n'.join(lines)
+        rows=[]
+        for e in items:
+            brief=f'{e["subject"][:20]} · {display_due(e["deadline"])[:5]}'
+            rows.append([ui_button('📖 '+brief, f'e:{e["id"]}:{route}')])
+        left=route.rsplit(':',1)[0] if route.startswith('v:') or route.startswith('sj:') else route
+        nav=[]
+        if page>0:nav.append(ui_button('◀️ Oldingi',left+':'+str(page-1)))
+        if page<pages-1:nav.append(ui_button('Keyingi ▶️',left+':'+str(page+1)))
+        if nav:rows.append(nav)
+        rows.append(self.back_row(return_to))
+        return self.render(cid,body,ui_markup(*rows),origin)
+
+    def subject_hash(self, name: str) -> str:
+        return hashlib.sha1(name.encode('utf-8')).hexdigest()[:10]
+
+    def subject_catalog(self,cid: int) -> list[tuple[str,int]]:
+        counts={}
+        for ev in self.store.list_events(cid):
+            counts[ev['subject']]=counts.get(ev['subject'],0)+1
+        return sorted(counts.items(),key=lambda x:x[0].casefold())
+
+    def subjects(self,cid: int,origin: dict | None = None):
+        entries=self.subject_catalog(cid)
+        rows=[[ui_button(f'📚 {subject} ({count})',f'sj:{self.subject_hash(subject)}:0')]
+              for subject,count in entries]
+        rows.append(self.back_row())
+        return self.render(cid,f'📚 <b>Fanlar bo‘yicha</b>\n\n{len(entries)} ta fan. Fan nomiga bosing:',ui_markup(*rows),origin)
+
+    def subject_events(self,cid: int,hashed: str,page: int,origin: dict | None = None):
+        names=[name for name,_ in self.subject_catalog(cid) if self.subject_hash(name)==hashed]
+        if not names:return self.subjects(cid,origin)
+        evs=[e for e in self.store.list_events(cid) if e['subject']==names[0]]
+        return self._event_list(cid,evs,f'📚 <b>{esc(names[0])}</b>',f'sj:{hashed}:{page}',
+                                page,'subjects',origin)
+
+    def event_detail(self,cid: int,event_id: str,back: str,kind: str,
+                     uid: int,origin: dict | None = None):
+        ev=self.store.get_event(cid,event_id)
+        if not ev or ev.get('hidden') or ev['track'] not in self.store.subscribed(cid):
+            return self.render(cid,'⚠️ Bu deadline mavjud emas yoki ushbu chatda yashirilgan.',
+                               ui_markup(self.back_row()),origin)
+        n=local_now()
+        text=('📌 <b>DEADLINE TAFSILOTLARI</b>\n\n'+event_line(ev,n)+'\n\n'
+              '<i>Deadline Moodle sahifasidagi ma’lumotlar asosida tuzilgan. '
+              'O‘zgarish bo‘lsa o‘qituvchidan tekshiring.</i>')
+        rows=[]
+        if ev.get('url','-')!='-' and valid_url(ev['url']):
+            rows.append([ui_button('🔗 Moodle’da ochish',url=ev['url'])])
+        if self.admin_allowed(cid,uid,kind):
+            rows.append([ui_button('✏️ Tahrirlash',f'man:{event_id}')])
+        rows.append(self.back_row(back if len(back)<45 else 'home'))
+        return self.render(cid,text,ui_markup(*rows),origin)
+
+    def language(self,cid: int,kind: str,origin: dict | None = None):
+        selected=self.store.subscribed(cid)
+        rows=[]
+        for tr in self.ENGLISH:
+            rows.append([ui_button(('✅ ' if tr in selected else '◻️ ')+label_track(tr),f'lg:{tr}')])
+        rows.append([ui_button('🚫 Ingliz tili tanlanmasin','lg:eng_none')])
+        for tr in self.RUSSIAN:
+            rows.append([ui_button(('✅ ' if tr in selected else '◻️ ')+label_track(tr),f'lg:{tr}')])
+        rows.append([ui_button('🚫 Rus tili tanlanmasin','lg:ru_none')])
+        rows.append(self.back_row())
+        english=next((label_track(t) for t in self.ENGLISH if t in selected),'tanlanmagan')
+        russian=next((label_track(t) for t in self.RUSSIAN if t in selected),'tanlanmagan')
+        caution=('\n\n<b>Eslatma:</b> guruhda level tanlansa, uning bildirishnomalari <b>butun guruhga</b> keladi. '
+                 'Har bir talaba shaxsiy chatda o‘z levelini tanlagani ma’qul.' if kind!='private' else '')
+        text=('🌐 <b>Til guruhini tanlash</b>\n\n'
+              f'🇬🇧 English: <b>{esc(english)}</b>\n🇷🇺 Русский: <b>{esc(russian)}</b>\n\n'
+              'Kerakli levelga bosing. Har bir tildan faqat bitta level faol bo‘ladi.\n'
+              'B1/A2 levellari uchun tasdiqlangan deadline’lar hali kiritilmagan.'+caution)
+        return self.render(cid,text,ui_markup(*rows),origin)
+
+    def leads_active(self,cid: int,hours: int) -> bool:
+        row=self.store.conn.execute('SELECT enabled FROM lead_choices WHERE chat_id=? AND lead_hours=?',
+                                    (cid,hours)).fetchone()
+        return bool(row['enabled']) if row is not None else True
+
+    def reminders(self,cid: int,kind: str,origin: dict | None = None):
+        enabled=self.store.enabled(cid)
+        rows=[[ui_button('🔕 O‘chirish' if enabled else '🔔 Yoqish','rem:onoff')]]
+        for hours in LEAD_HOURS:
+            rows.append([ui_button(('✅ ' if self.leads_active(cid,hours) else '◻️ ')+label_lead(hours)+' oldin',
+                                   f'rem:lead:{hours}')])
+        rows.append(self.back_row())
+        return self.render(cid,'🔔 <b>Eslatma sozlamalari</b>\n\n'
+                           f'Hozirgi holat: <b>{"yoqilgan ✅" if enabled else "o‘chirilgan 🔕"}</b>\n\n'
+                           'Eslatmani qachon olishni belgilang. Telegram xabarlari aniq belgilangan '
+                           'muddatlarda yuboriladi.\n\n'
+                           + ('<i>Guruh sozlamalarini faqat administrator o‘zgartira oladi.</i>' if kind!='private'
+                              else '<i>Shaxsiy eslatmalarni to‘g‘ridan-to‘g‘ri shu chatda olasiz.</i>'),
+                           ui_markup(*rows),origin)
+
+    def status(self,cid: int,origin: dict | None = None):
+        tracks=', '.join(label_track(t) for t in sorted(self.store.subscribed(cid)))
+        events=self.store.list_events(cid)
+        text=('📊 <b>Holat</b>\n\n'
+              f'🔔 Eslatmalar: {"✅ yoqilgan" if self.store.enabled(cid) else "🔕 o‘chirilgan"}\n'
+              f'🌐 Yo‘nalishlar: {esc(tracks)}\n📚 Kelgusi deadline: <b>{len(events)} ta</b>\n'
+              '⏱ Toshkent vaqti (UTC+5)\n\n'
+              'Moodle’dagi deadline’lar avtomatik sinxronlashtirilmaydi.')
+        return self.render(cid,text,ui_markup([ui_button('🔔 Eslatmalarni sozlash','rem')],
+                                              self.back_row()),origin)
+
+    def unknown(self,cid: int,origin: dict | None = None):
+        rows=[e for e in self.store.undated if e['track'] in self.store.subscribed(cid)]
+        text='❔ <b>Deadline ko‘rsatilmagan topshiriqlar</b>\n\n'
+        text+='\n\n'.join(f'📚 <b>{esc(e["subject"])}</b>\n📖 {esc(e["topic"])}'
+                          + (f'\n<a href="{esc(e["url"])}">Moodle sahifasi</a>'
+                             if e.get('url') and valid_url(e['url']) else '')
+                          for e in rows) if rows else 'Hozircha bunday topshiriq topilmadi.'
+        return self.render(cid,text,ui_markup(self.back_row()),origin)
+
+    def help_screen(self,cid: int,origin: dict | None = None):
+        text=('💡 <b>Qanday ishlaydi?</b>\n\n'
+              '• <b>Deadline</b> — fan, mavzu, qachon topshirish va Moodle havolasi.\n'
+              '• <b>Til guruhim</b> — English va rus tilidagi o‘z levelingizni belgilang.\n'
+              '• <b>Eslatmalar</b> — qaysi vaqtda eslatma kelishini tanlang.\n'
+              '• <b>Admin panel</b> — guruh uchun vazifa qo‘shish yoki sanani to‘g‘rilash.\n\n'
+              '<b>⚠️ Muhim:</b> Bot Moodle’ga kirmaydi. O‘qituvchi sanani o‘zgartirsa, '
+              'admin ma’lumotni qo‘lda yangilashi kerak.')
+        return self.render(cid,text,ui_markup([ui_button('❔ Sanasiz vazifalar','unknown')],
+                                              [ui_button('📊 Holat','status')],self.back_row()),origin)
+
+    def admin_panel(self,cid: int,kind: str,uid: int,origin: dict | None = None):
+        if not self.admin_allowed(cid,uid,kind):
+            return self.render(cid,'⛔ <b>Admin panel</b> faqat guruh administratorlariga ochiq.',
+                               ui_markup(self.back_row()),origin)
+        text=('🛠 <b>Administrator paneli</b>\n\n'
+              '➕ Yangi topshiriq qo‘shing\n'
+              '✏️ Mavjud deadline’ning sanasi yoki mavzusini yangilang\n'
+              '👁 Guruhda noto‘g‘ri topshiriqni yashiring\n'
+              '🔔 Sinov eslatmasini ko‘ring\n\n'
+              '<i>O‘zgarishlar faqat ushbu chatga tegishli; '
+              'tasdiqlanmagan sanalarni kiritmang.</i>')
+        rows=ui_markup([ui_button('➕ Deadline qo‘shish','ad:new')],
+                       [ui_button('✏️ Deadline tahrirlash','ad:list:0')],
+                       [ui_button('🔔 Sinov eslatmasi','ad:test')],
+                       self.back_row())
+        return self.render(cid,text,rows,origin)
+
+    def manage_list(self,cid: int,page: int,origin: dict | None = None):
+        events=self.store.list_events(cid,future_only=False,show_hidden=True)
+        page=max(0,min(page,max(0,(len(events)-1)//5)))
+        items=events[page*5:page*5+5]
+        text=f'✏️ <b>Deadline tahrirlash</b>\n\n{len(events)} ta vazifa. Keraklisini tanlang:'
+        rows=[[ui_button(('🙈 ' if e.get('hidden') else '📌 ')+e['subject'][:23]+' · '+e['id'],
+                         f'man:{e["id"]}')] for e in items]
+        nav=[]
+        if page: nav.append(ui_button('◀️',f'ad:list:{page-1}'))
+        if (page+1)*5<len(events):nav.append(ui_button('▶️',f'ad:list:{page+1}'))
+        if nav: rows.append(nav)
+        rows.append(self.back_row('admin'))
+        return self.render(cid,text,ui_markup(*rows),origin)
+
+    def manage_detail(self,cid: int,event_id: str,origin: dict | None = None):
+        e=self.store.get_event(cid,event_id)
+        if not e:return self.manage_list(cid,0,origin)
+        body=('🛠 <b>Topshiriqni boshqarish</b>\n\n'+event_line(e,local_now())+
+              ('\n🙈 <b>Hozir yashirilgan</b>' if e.get('hidden') else ''))
+        rows=ui_markup([ui_button('📅 Sanani o‘zgartirish',f'ad:date:{event_id}')],
+                       [ui_button('📝 Mavzuni o‘zgartirish',f'ad:topic:{event_id}')],
+                       [ui_button('👁 Qayta ko‘rsatish' if e.get('hidden') else '🙈 Yashirish',
+                                  f'ad:{"unhide" if e.get("hidden") else "hide"}:{event_id}')],
+                       *([[ui_button('🗑 O‘chirish',f'ad:del:{event_id}')]]
+                         if event_id.startswith('C') else []),
+                       self.back_row('ad:list:0'))
+        return self.render(cid,body,rows,origin)
+
+    def draft_save(self,cid:int,uid:int,stage:str,data:dict):
+        self.store.conn.execute('''INSERT INTO ui_drafts VALUES (?,?,?,?,?)
+          ON CONFLICT(chat_id,user_id) DO UPDATE SET stage=excluded.stage,payload=excluded.payload,
+          updated_at=excluded.updated_at''',(cid,uid,stage,json.dumps(data,ensure_ascii=False),local_now().isoformat()))
+        self.store.conn.commit()
+
+    def draft_get(self,cid:int,uid:int):
+        row=self.store.conn.execute('SELECT stage,payload,updated_at FROM ui_drafts WHERE chat_id=? AND user_id=?',
+                                    (cid,uid)).fetchone()
+        if not row:return None
+        if local_now()-datetime.fromisoformat(row['updated_at'])>self.DRAFT_TIMEOUT:
+            self.draft_clear(cid,uid);return None
+        return row['stage'],json.loads(row['payload'])
+
+    def draft_clear(self,cid:int,uid:int):
+        self.store.conn.execute('DELETE FROM ui_drafts WHERE chat_id=? AND user_id=?',(cid,uid))
+        self.store.conn.commit()
+
+    def prompt(self,cid:int,text:str):
+        return self.send(cid,text+'\n\n<i>Javob yozing (bekor qilish: /cancel).</i>',
+                         {'force_reply':True,'input_field_placeholder':'Javobingizni shu yerga yozing'})
+
+    def start_new(self,cid:int,uid:int,origin:dict | None = None):
+        body=('➕ <b>Yangi deadline</b>\n\n'
+              '1/6 · Avval qaysi talabalar uchun ekanini tanlang.\n'
+              '<i>Umumiy</i> — barcha talabalar uchun. Til levelini faqat tegishli guruhga qo‘shing.')
+        buttons=ui_markup([ui_button('📚 Umumiy fanlar','new:common')],
+                           [ui_button('🇬🇧 English Upper-Intermediate','new:eng_ui')],
+                           [ui_button('🇬🇧 English B1','new:eng_b1'),ui_button('🇬🇧 English A2','new:eng_a2')],
+                           [ui_button('🇷🇺 Rus tili A2','new:ru_a2'),ui_button('🇷🇺 Rus tili B1','new:ru_b1')],
+                           self.back_row('admin'))
+        return self.render(cid,body,buttons,origin)
+
+    def process_draft(self,message:dict) -> bool:
+        raw=(message.get('text') or '').strip()
+        ch=message['chat'];cid=int(ch['id']);kind=ch.get('type','private');uid=int(message.get('from',{}).get('id',0))
+        state=self.draft_get(cid,uid)
+        if not state:return False
+        if raw=='/cancel':
+            self.draft_clear(cid,uid)
+            self.send(cid,'✅ Tahrirlash bekor qilindi.',ui_markup([ui_button('🏠 Menyu','home')]))
+            return True
+        if raw.startswith('/') and not (raw=='/skip' and self.draft_get(cid,uid)[0]=='new:url'):
+            return False
+        if not raw:return True
+        if kind!='private':
+            if not self.admin_allowed(cid,uid,kind):
+                self.draft_clear(cid,uid);return True
+            # Privacy mode delivers replies to the bot's ForceReply prompt.
+            reply=message.get('reply_to_message') or {}
+            if not reply.get('from',{}).get('is_bot'):
+                return False
+        stage,data=state
+        if stage in ('date','topic'):
+            event_id=data['event_id']
+            if not self.store.has_event(cid,event_id):
+                self.draft_clear(cid,uid);self.send(cid,'❌ Topshiriq topilmadi.');return True
+            if stage=='date':
+                try:val=parse_user_date(raw)
+                except ValueError:
+                    self.prompt(cid,'❌ Sana formati xato. Namuna: <code>2026-12-04 23:59</code>');return True
+                if parse_due(val)<=local_now():
+                    self.prompt(cid,'❌ O‘tgan sana qabul qilinmaydi. Kelgusi sanani kiriting.');return True
+                self.store.override(cid,event_id,deadline=val)
+            else:
+                if len(raw)>350:
+                    self.prompt(cid,'❌ Mavzu juda uzun (maksimum 350 belgi).');return True
+                self.store.override(cid,event_id,topic=raw)
+            self.draft_clear(cid,uid)
+            self.manage_detail(cid,event_id)
+            return True
+        if stage.startswith('new:'):
+            key=stage.split(':',1)[1]
+            stage_order=['subject','kind','topic','deadline','url']
+            if key not in stage_order:
+                self.draft_clear(cid,uid);return True
+            if key in ('subject','kind','topic'):
+                limit=350 if key=='topic' else 200
+                if len(raw)>limit:
+                    self.prompt(cid,f'❌ Maksimum {limit} belgi. Qisqaroq yozing.');return True
+                data[key]=raw
+            elif key=='deadline':
+                try:val=parse_user_date(raw)
+                except ValueError:
+                    self.prompt(cid,'❌ Sana formati: <code>2026-12-04 23:59</code>');return True
+                if parse_due(val)<=local_now():
+                    self.prompt(cid,'❌ Bu muddat allaqachon o‘tgan.');return True
+                data['deadline']=val
+            elif key=='url':
+                if raw.lower() in ('-','yo‘q','yoq','skip','havola yo‘q','/skip'):
+                    raw='-'
+                if not valid_url(raw):
+                    self.prompt(cid,'❌ HTTPS havolani to‘liq yuboring (https://...). Havola yo‘q bo‘lsa <code>-</code> yozing.');return True
+                code=self.store.add_event(cid,data['deadline'],data['subject'],data['kind'],data['topic'],data['track'],raw)
+                self.draft_clear(cid,uid)
+                self.send(cid,f'✅ <b>Deadline qo‘shildi!</b>\n\n'+event_line(self.store.get_event(cid,code),local_now())+
+                          '\n\n<i>Til leveli bo‘lsa, shu chatda level yoqilganligini tekshiring.</i>',
+                          ui_markup([ui_button('🛠 Tahrirlash',f'man:{code}')],self.back_row()))
+                return True
+            index=stage_order.index(key)+1
+            next_key=stage_order[index]
+            asks={'kind':'3/6 · Nazorat turini yozing (masalan: 1-oraliq nazorat)',
+                  'topic':'4/6 · Aynan qaysi mavzudan? Moodle’da ko‘rsatilgan nomini yozing.',
+                  'deadline':'5/6 · Deadline (Toshkent vaqti). Namuna: <code>2026-12-04 23:59</code>',
+                  'url':'6/6 · Moodle topshirig‘ining HTTPS havolasi. Yo‘q bo‘lsa <code>-</code> yozing.'}
+            self.draft_save(cid,uid,'new:'+next_key,data)
+            self.prompt(cid,asks[next_key]);return True
+        return False
+
+    def handle_message(self, message: dict) -> None:
+        raw=(message.get('text') or '').strip()
+        ch=message['chat'];cid=int(ch['id']);kind=ch.get('type','private');uid=int(message.get('from',{}).get('id',0))
+        if self.process_draft(message):return
+        command=raw.split()[0].split('@')[0].lower() if raw.startswith('/') else ''
+        title=ch.get('title') or ch.get('first_name') or ''
+        if command in ('/start','/menu','/help'):
+            self.store.register(cid,kind,title,enable=(True if kind=='private' and command=='/start' else None))
+            self.menu(cid,kind);return
+        if command in ('/next','/today','/week','/all'):
+            self.store.register(cid,kind,title)
+            self.view_events(cid,command[1:]);return
+        if command=='/unknown':
+            self.store.register(cid,kind,title);self.unknown(cid);return
+        if command=='/status':
+            self.store.register(cid,kind,title);self.status(cid);return
+        if command=='/cancel':
+            self.draft_clear(cid,uid)
+            self.menu(cid,kind);return
+        if command=='/test' and kind!='private' and not self.admin_allowed(cid,uid,kind):
+            self.send(cid,'⛔ Sinov eslatmasini faqat guruh administratori yuboradi.');return
+        if command:
+            return super().handle_message(message)  # legacy text commands remain supported
+
+    def handle_callback(self,cq:dict):
+        msg=cq.get('message') or {}
+        ch=msg.get('chat') or {}
+        if not ch or not cq.get('data'):return
+        cid=int(ch['id']);kind=ch.get('type','private');uid=int(cq.get('from',{}).get('id',0))
+        data=cq['data']
+        self.store.register(cid,kind,ch.get('title') or ch.get('first_name') or '')
+        privileged=(data.startswith(('ad:','new:','man:')) or
+                    data.startswith(('rem:onoff','rem:lead:','lg:')))
+        if privileged and kind!='private' and not self.admin_allowed(cid,uid,kind):
+            try:self.api.call('answerCallbackQuery',callback_query_id=cq['id'],
+                              text='Bu sozlamani faqat guruh admini o‘zgartiradi.',show_alert=True)
+            except Exception:pass
+            return
+        try:self.api.call('answerCallbackQuery',callback_query_id=cq['id'])
+        except Exception:pass
+        try:
+            if data=='home':return self.menu(cid,kind,msg)
+            if data=='subjects':return self.subjects(cid,msg)
+            if data=='lang':return self.language(cid,kind,msg)
+            if data=='rem':return self.reminders(cid,kind,msg)
+            if data=='status':return self.status(cid,msg)
+            if data=='unknown':return self.unknown(cid,msg)
+            if data=='help':return self.help_screen(cid,msg)
+            if data=='admin':return self.admin_panel(cid,kind,uid,msg)
+            if data.startswith('v:'):
+                parts=data.split(':')
+                mode=parts[1]
+                if mode not in ('next','today','week','all'):return
+                page=int(parts[2]) if len(parts)>2 and parts[2].isdigit() else 0
+                return self.view_events(cid,mode,page,msg)
+            if data.startswith('sj:'):
+                parts=data.split(':')
+                if len(parts)!=3 or not re.fullmatch(r'[0-9a-f]{10}',parts[1]):return
+                return self.subject_events(cid,parts[1],int(parts[2]),msg)
+            if data.startswith('e:'):
+                parts=data.split(':',2)
+                if len(parts)!=3:return
+                event_id,back=parts[1:]
+                return self.event_detail(cid,event_id,back,kind,uid,msg)
+            if data.startswith('lg:'):
+                tr=data.split(':',1)[1]
+                if tr.startswith('eng_'):
+                    family=self.ENGLISH
+                elif tr.startswith('ru_'):
+                    family=self.RUSSIAN
+                else:return
+                if tr not in family and tr not in ('eng_none','ru_none'):return
+                for old in family:self.store.track_change(cid,old,old==tr)
+                return self.language(cid,kind,msg)
+            if data=='rem:onoff':
+                self.store.register(cid,kind,ch.get('title') or '',enable=not self.store.enabled(cid))
+                return self.reminders(cid,kind,msg)
+            if data.startswith('rem:lead:'):
+                hours=int(data.split(':')[2])
+                if hours not in LEAD_HOURS:return
+                enabled=not self.leads_active(cid,hours)
+                self.store.conn.execute('''INSERT INTO lead_choices VALUES(?,?,?)
+                    ON CONFLICT(chat_id,lead_hours) DO UPDATE SET enabled=excluded.enabled''',
+                                        (cid,hours,int(enabled)))
+                self.store.conn.commit()
+                return self.reminders(cid,kind,msg)
+            if data=='ad:new':return self.start_new(cid,uid,msg)
+            if data.startswith('new:'):
+                track=data.split(':',1)[1]
+                if track not in TRACK_LABELS:return
+                self.draft_save(cid,uid,'new:subject',{'track':track})
+                self.prompt(cid,'2/6 · Fan nomini yozing. Masalan: <b>Iqtisodiyot nazariyasi</b>')
+                return
+            if data=='ad:test':
+                self.send_events(cid,'🔔 <b>Sinov eslatmasi</b>',self.store.list_events(cid)[:1],local_now())
+                return self.admin_panel(cid,kind,uid,msg)
+            if data.startswith('ad:list:'):
+                try:page=int(data.rsplit(':',1)[1])
+                except ValueError:return
+                return self.manage_list(cid,page,msg)
+            if data.startswith('man:'):
+                return self.manage_detail(cid,data.split(':',1)[1],msg)
+            if data.startswith('ad:'):
+                parts=data.split(':',2)
+                if len(parts)!=3:return
+                _,action,event_id=parts
+                ev=self.store.get_event(cid,event_id)
+                if not ev:return self.manage_list(cid,0,msg)
+                if action in ('date','topic'):
+                    self.draft_save(cid,uid,action,{'event_id':event_id})
+                    if action=='date':
+                        self.prompt(cid,'📅 Yangi sanani kiriting: <code>2026-12-04 23:59</code>')
+                    else:
+                        self.prompt(cid,'📝 Tasdiqlangan yangi mavzuni yozing.')
+                    return
+                if action in ('hide','unhide'):
+                    self.store.override(cid,event_id,hidden=(action=='hide'))
+                    return self.manage_detail(cid,event_id,msg)
+                if action=='del':
+                    if not event_id.startswith('C'):return
+                    return self.render(cid,f'⚠️ <b>{esc(ev["subject"])}</b> topshirig‘i butunlay o‘chirilsinmi?',
+                                       ui_markup([ui_button('🗑 Ha, o‘chirish',f'ad:yesdel:{event_id}')],
+                                                 [ui_button('❌ Bekor qilish',f'man:{event_id}')]),msg)
+                if action=='yesdel':
+                    if event_id.startswith('C'):self.store.remove_event(cid,event_id)
+                    return self.manage_list(cid,0,msg)
+        except Exception:
+            LOGGER.exception('Could not handle button %s in chat %s',data[:50],cid)
+            self.send(cid,'⚠️ Menyuda xatolik yuz berdi. /menu orqali qayta urinib ko‘ring.')
+
+    def dispatch_due(self, now: datetime | None = None) -> int:
+        now=now or local_now()
+        count=0
+        for chat in self.store.known_chats():
+            cid=int(chat['chat_id'])
+            pending=pending_reminders(self.store,cid,now)
+            for hours,evs in sorted(pending.items(),reverse=True):
+                if not self.leads_active(cid,hours):continue
+                heading=f'⏰ <b>DEADLINE’GA {esc(label_lead(hours).upper())} QOLDI</b>\n📍 Toshkent vaqti (UTC+5)'
+                chunks=take_chunks([notification_line(ev,now) for ev in evs],heading)
+                try:
+                    for chunk in chunks:self.send(cid,chunk)
+                    self.store.mark_sent(cid,evs,hours,now)
+                    count+=len(evs)
+                except Exception as exc:
+                    LOGGER.exception('Could not notify chat %s: %s',cid,exc)
+        return count
+
+
 def main():
     load_dotenv(ROOT/'.env')
     token=os.environ.get('BOT_TOKEN','').strip()
@@ -551,13 +1083,14 @@ def main():
         return 2
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     store=Store(os.environ.get('DB_PATH',str(ROOT/'data'/'uwed_bot.sqlite3')))
-    bot=Bot(TelegramAPI(token),store)
+    bot=ButtonBot(TelegramAPI(token),store)
     try:
         me=bot.api.call('getMe')
         LOGGER.info('Telegram bot connected: @%s',me.get('username'))
         try:
             bot.api.call('setMyCommands',commands=[
-                {'command':'start','description':'Botni ishga tushirish'},
+                {'command':'start','description':'Bosh menyu (tugmalar)'},
+                {'command':'menu','description':'Menyuni ochish'},
                 {'command':'next','description':'Eng yaqin 5 ta deadline'},
                 {'command':'today','description':'24 soat ichidagi deadline'},
                 {'command':'week','description':'7 kunlik deadline'},
@@ -565,7 +1098,7 @@ def main():
                 {'command':'status','description':'Eslatmalar va level holati'},
                 {'command':'track','description':'Til levelini tanlash'},
                 {'command':'enable','description':'Guruhda eslatmani yoqish (admin)'},
-                {'command':'help','description':'Bot buyruqlari'}])
+                {'command':'help','description':'Qisqa yordam'}])
         except Exception as exc:
             LOGGER.warning('Telegram commands menyusini sozlab bo‘lmadi: %s',exc)
     except Exception as exc:
